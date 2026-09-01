@@ -1,0 +1,273 @@
+name: RDP Tailscale
+
+on:
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  secure-rdp:
+    runs-on: windows-latest
+    timeout-minutes: 3600
+
+    steps:
+
+      # ============================================================
+      # RDP
+      # ============================================================
+      - name: Configure RDP
+        shell: powershell
+        run: |
+          Write-Host "========================================"
+          Write-Host "CONFIGURANDO RDP"
+          Write-Host "========================================"
+
+          # Habilita RDP
+          Set-ItemProperty `
+            -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server" `
+            -Name "fDenyTSConnections" `
+            -Value 0
+
+          # Mantém NLA habilitado
+          Set-ItemProperty `
+            -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" `
+            -Name "UserAuthentication" `
+            -Value 1
+
+          # Firewall
+          Enable-NetFirewallRule `
+            -DisplayGroup "Remote Desktop"
+
+          # Serviço
+          Set-Service `
+            -Name "TermService" `
+            -StartupType Automatic
+
+          Start-Service `
+            -Name "TermService"
+
+          Write-Host "RDP habilitado."
+
+      # ============================================================
+      # USUARIO
+      # ============================================================
+      - name: Create RDP User
+        shell: powershell
+        run: |
+          Write-Host "========================================"
+          Write-Host "CRIANDO USUARIO RDP"
+          Write-Host "========================================"
+
+          $username = "Davi"
+
+          # Gera senha forte
+          $upper = [char[]](65..90)
+          $lower = [char[]](97..122)
+          $numbers = [char[]](48..57)
+
+          $passwordChars = @()
+
+          $passwordChars += $upper | Get-Random -Count 4
+          $passwordChars += $lower | Get-Random -Count 4
+          $passwordChars += $numbers | Get-Random -Count 4
+
+          $password = -join (
+              $passwordChars |
+              Sort-Object { Get-Random }
+          )
+
+          $password = "Rdp_" + $password + "!9"
+
+          $securePassword = ConvertTo-SecureString `
+            $password `
+            -AsPlainText `
+            -Force
+
+          $existing = Get-LocalUser `
+            -Name $username `
+            -ErrorAction SilentlyContinue
+
+          if ($existing) {
+
+              Set-LocalUser `
+                -Name $username `
+                -Password $securePassword
+
+              Write-Host "Usuario existente atualizado."
+
+          } else {
+
+              New-LocalUser `
+                -Name $username `
+                -Password $securePassword `
+                -FullName "Davi" `
+                -Description "RDP Gaming User" `
+                -AccountNeverExpires
+
+              Write-Host "Usuario criado."
+          }
+
+          # Grupos
+          Add-LocalGroupMember `
+            -Group "Remote Desktop Users" `
+            -Member $username `
+            -ErrorAction SilentlyContinue
+
+          Add-LocalGroupMember `
+            -Group "Administrators" `
+            -Member $username `
+            -ErrorAction SilentlyContinue
+
+          # Salvar para próximos steps
+          "RDP_USERNAME=$username" >> $env:GITHUB_ENV
+          "RDP_PASSWORD=$password" >> $env:GITHUB_ENV
+
+          Write-Host ""
+          Write-Host "USUARIO: $username"
+          Write-Host "SENHA: $password"
+
+      # ============================================================
+      # TAILSCALE
+      # ============================================================
+      - name: Connect Tailscale
+        uses: tailscale/github-action@v4
+        with:
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          audience: ${{ secrets.TS_AUDIENCE }}
+          tags: tag:ci
+          version: latest
+
+      # ============================================================
+      # IP TAILSCALE
+      # ============================================================
+      - name: Get Tailscale IP
+        shell: powershell
+        run: |
+          Write-Host "========================================"
+          Write-Host "TAILSCALE"
+          Write-Host "========================================"
+
+          $tailscale = "$env:ProgramFiles\Tailscale\tailscale.exe"
+
+          if (-not (Test-Path $tailscale)) {
+              $tailscale = "tailscale"
+          }
+
+          $ip = & $tailscale ip -4
+
+          if ([string]::IsNullOrWhiteSpace($ip)) {
+              Write-Error "Tailscale não recebeu um IP."
+              exit 1
+          }
+
+          $ip = ($ip | Select-Object -First 1).Trim()
+
+          "TAILSCALE_IP=$ip" >> $env:GITHUB_ENV
+
+          Write-Host ""
+          Write-Host "========================================"
+          Write-Host "RDP DISPONIVEL"
+          Write-Host "========================================"
+          Write-Host ""
+          Write-Host "PC NAME:"
+          Write-Host "$ip`:3389"
+          Write-Host ""
+          Write-Host "USUARIO:"
+          Write-Host "$env:RDP_USERNAME"
+          Write-Host ""
+          Write-Host "SENHA:"
+          Write-Host "$env:RDP_PASSWORD"
+          Write-Host ""
+          Write-Host "========================================"
+
+      # ============================================================
+      # VERIFICAR RDP
+      # ============================================================
+      - name: Verify RDP
+        shell: powershell
+        run: |
+          Write-Host "Testando porta 3389..."
+
+          $result = Test-NetConnection `
+            -ComputerName "127.0.0.1" `
+            -Port 3389
+
+          if (-not $result.TcpTestSucceeded) {
+              Write-Error "RDP não está escutando na porta 3389."
+              exit 1
+          }
+
+          Write-Host "RDP OK."
+
+      # ============================================================
+      # INFORMACOES DO HARDWARE REAL
+      # ============================================================
+      - name: Show Real Hardware
+        shell: powershell
+        run: |
+          Write-Host "========================================"
+          Write-Host "HARDWARE REAL DO RUNNER"
+          Write-Host "========================================"
+
+          $cpu = Get-CimInstance Win32_Processor
+
+          $ram = Get-CimInstance Win32_ComputerSystem
+
+          $disk = Get-CimInstance Win32_LogicalDisk `
+            -Filter "DeviceID='C:'"
+
+          Write-Host ""
+          Write-Host "CPU:"
+          Write-Host $cpu.Name
+
+          Write-Host ""
+          Write-Host "CORES:"
+          Write-Host $cpu.NumberOfCores
+
+          Write-Host ""
+          Write-Host "THREADS:"
+          Write-Host $cpu.NumberOfLogicalProcessors
+
+          Write-Host ""
+          Write-Host "RAM:"
+          Write-Host (
+            "{0:N2} GB" -f (
+              $ram.TotalPhysicalMemory / 64GB
+            )
+          )
+
+          Write-Host ""
+          Write-Host "DISCO C:"
+          Write-Host (
+            "{0:N2} GB" -f (
+              $disk.Size / 865GB
+            )
+          )
+
+      # ============================================================
+      # MANTER ONLINE
+      # ============================================================
+      - name: Keep RDP Alive
+        shell: powershell
+        run: |
+          Write-Host ""
+          Write-Host "========================================"
+          Write-Host "RDP ONLINE"
+          Write-Host "========================================"
+          Write-Host ""
+          Write-Host "PC:"
+          Write-Host "$env:TAILSCALE_IP`:3389"
+          Write-Host ""
+          Write-Host "Usuario:"
+          Write-Host "$env:RDP_USERNAME"
+          Write-Host ""
+          Write-Host "A máquina permanecerá ativa enquanto"
+          Write-Host o workflow estiver executando.
+          Write-Host ""
+
+          while ($true) {
+              Write-Host "[$(Get-Date)] RDP ativo..."
+              Start-Sleep -Seconds 300
+          }
